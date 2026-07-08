@@ -122,9 +122,14 @@ function clause decode (0b1101010100@[L]@0b1@(o0:bits(1))@(op1:bits(3))@(CRn:bit
   decodeSystemRegisterMove(L == bitone, op0, op1, CRn, CRm, op2, Rt)
 }
 
-/* The lookup result is (register reference, minimum EL, readable, writable). */
-val lookup_sys_reg : SysRegID -> (register(bits(64)), bits(2), bool, bool)
-function lookup_sys_reg(sys_reg_id) = {
+enum SysRegAccessor = {
+  SysReg64,
+  SysRegPSTATE
+}
+
+/* The 64-bit lookup result is (register reference, minimum EL, readable, writable). */
+val lookup_sys_reg64 : SysRegID -> (register(bits(64)), bits(2), bool, bool)
+function lookup_sys_reg64(sys_reg_id) = {
   match sys_reg_id {
     0xC038 => (ref ID_AA64MMFR0_EL1, 0b01, true, false),
     0xC039 => (ref ID_AA64MMFR1_EL1, 0b01, true, false),
@@ -145,13 +150,67 @@ function lookup_sys_reg(sys_reg_id) = {
   }
 }
 
+/* The lookup result is (register accessor, minimum EL, readable, writable). */
+val lookup_sys_reg : SysRegID -> (SysRegAccessor, bits(2), bool, bool)
+function lookup_sys_reg(sys_reg_id) = {
+  match sys_reg_id {
+    0xC212 => (SysRegPSTATE, 0b01, true, false),
+    0xDA10 => (SysRegPSTATE, 0b00, true, true),
+    0xDA11 => (SysRegPSTATE, 0b00, true, true),
+    _ => {
+      let (_, min_el, readable, writable) = lookup_sys_reg64(sys_reg_id);
+      (SysReg64, min_el, readable, writable)
+    }
+  }
+}
+
+val read_sys_reg : (SysRegID, SysRegAccessor) -> bits(64)
+function read_sys_reg(sys_reg_id, accessor) = {
+  match accessor {
+    SysReg64 => {
+      let (reg_ref, _, _, _) = lookup_sys_reg64(sys_reg_id);
+      sail_sys_reg_read(sys_reg_id, reg_ref)
+    },
+    SysRegPSTATE => match sys_reg_id {
+      0xC212 => {
+        let current_el = sail_sys_reg_read(sys_reg_id, ref CurrentEL);
+        sail_zero_extend(current_el @ 0b00, 64)
+      },
+      0xDA10 => {
+        let nzcv = sail_sys_reg_read(sys_reg_id, ref NZCV);
+        sail_zero_extend(nzcv @ 0x0000000, 64)
+      },
+      0xDA11 => {
+        let daif = sail_sys_reg_read(sys_reg_id, ref DAIF);
+        sail_zero_extend(daif @ 0b000000, 64)
+      },
+      _ => fail("Unsupported PSTATE System Register")
+    }
+  }
+}
+
+val write_sys_reg : (SysRegID, SysRegAccessor, bits(64)) -> unit
+function write_sys_reg(sys_reg_id, accessor, value) = {
+  match accessor {
+    SysReg64 => {
+      let (reg_ref, _, _, _) = lookup_sys_reg64(sys_reg_id);
+      sail_sys_reg_write(sys_reg_id, reg_ref, value)
+    },
+    SysRegPSTATE => match sys_reg_id {
+      0xDA10 => sail_sys_reg_write(sys_reg_id, ref NZCV, value[31..28]),
+      0xDA11 => sail_sys_reg_write(sys_reg_id, ref DAIF, value[9..6]),
+      _ => fail("Unsupported PSTATE System Register write")
+    }
+  }
+}
+
 function decodeSystemRegisterMove(is_read, op0, op1, CRn, CRm, op2, Rt) = {
   let sys_reg_id = op0 @ op1 @ CRn @ CRm @ op2;
   SystemRegisterMove(is_read, sys_reg_id, unsigned(Rt))
 }
 
 function clause execute SystemRegisterMove(is_read, sys_reg_id, t) = {
-  let (reg_ref, min_el, readable, writable) = lookup_sys_reg(sys_reg_id);
+  let (accessor, min_el, readable, writable) = lookup_sys_reg(sys_reg_id);
   assert(unsigned(CurrentEL) >= unsigned(min_el),
          "Trying to access system register from too-low EL, fault not implemented");
 
@@ -160,7 +219,7 @@ function clause execute SystemRegisterMove(is_read, sys_reg_id, t) = {
 
   _PC = _PC + 4;
 
-  if is_read then X(t) = sail_sys_reg_read(sys_reg_id, reg_ref)
-  else sail_sys_reg_write(sys_reg_id, reg_ref, X(t))
+  if is_read then X(t) = read_sys_reg(sys_reg_id, accessor)
+  else write_sys_reg(sys_reg_id, accessor, X(t))
 }
 $endif
